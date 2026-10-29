@@ -1,13 +1,17 @@
-"""kbfix_hotkey.py - กด Shift+Backspace 1 ครั้ง เพื่อแก้ข้อความที่พิมพ์ผิดภาษา
+"""kbfix_hotkey.py - แกนหลักของ KbFix: กด Shift+Backspace 1 ครั้งเพื่อแก้ข้อความที่พิมพ์ผิดภาษา
 
-ติดตั้ง:   pip install keyboard mouse pyperclip pythainlp
-รัน:       python kbfix_hotkey.py      (วาง kbfix.py ไว้โฟลเดอร์เดียวกัน)
-หยุด:      Ctrl+C ในหน้าต่างที่รันอยู่
+รันแบบคอนโซล (ไม่มีหน้าต่าง):
+    pip install keyboard mouse pyperclip
+    python kbfix_hotkey.py
 
-สองโหมด (เลือกอัตโนมัติ):
+สามโหมด (เลือกอัตโนมัติ):
   1) เอาเมาส์ลากคลุม (หรือดับเบิล/ทริปเปิลคลิก) แล้วกด Shift+Backspace -> แก้ข้อความที่คลุมไว้
-  2) พิมพ์เสร็จแล้วกด Shift+Backspace เลย -> แก้คำล่าสุด (ไม่ต้องคลุม)
+  2) พิมพ์เสร็จแล้วกด Shift+Backspace เลย -> แก้คำล่าสุด
+  3) กดซ้ำทันทีหลังแก้ -> สลับกลับ/สลับไปมาได้เรื่อย ๆ (จำว่าบนหน้าจอเป็นภาษาอะไรอยู่ ไม่ต้องพึ่งการตรวจแป้นภาษา)
+
+หมายเหตุ: log จะไม่บันทึกตัวอักษรที่พิมพ์ บันทึกเฉพาะโหมด จำนวนตัวอักษร และข้อผิดพลาด
 """
+import logging
 import re
 import sys
 import threading
@@ -15,14 +19,19 @@ import time
 
 from kbfix import EN2TH, EN_NORMAL, EN_SHIFT, TH2EN, english_score, thai_score
 
+log = logging.getLogger("kbfix")
+log.addHandler(logging.NullHandler())
+
 # คีย์ลัดสลับภาษาของ Windows (ปรับตามเครื่องคุณ เช่น "alt+shift" หรือ "ctrl+shift")
 SWITCH_HOTKEY = "windows+space"
-# โหมดคลุมข้อความ: แก้เสร็จแล้วสลับภาษาแป้นให้ตรงกับภาษาที่แปลงออกมา
+# สลับภาษาแป้นให้ตรงกับข้อความที่แปลงออกมาหลังแก้ข้อความที่คลุม
 SWITCH_AFTER_SELECTION = True
 
 MAX_BUF = 200
 DRAG_PX = 4            # ลากเกินกี่พิกเซลถึงนับว่าเป็นการคลุม
 MULTI_CLICK_SEC = 0.5  # คลิกซ้ำเร็วกว่านี้ = ดับเบิล/ทริปเปิลคลิก
+SHIFT_WAIT_SEC = 0.6   # รอให้ปล่อย Shift ก่อนเริ่มแก้ (ไม่งั้นปุ่มที่โปรแกรมกดเองจะกลายเป็น Shift+...)
+AFTER_FIX_SEC = 0.3    # หน่วงหลังแก้เสร็จ กันเหตุการณ์ปุ่มที่โปรแกรมกดเองหลุดเข้ามานับ
 SENTINEL = "\u200b__kbfix_probe__\u200b"
 
 # ---------- scan code (PC/AT set 1) -> ตัวอักษรบน QWERTY ----------
@@ -44,13 +53,28 @@ BACKSPACE = 0x0E
 EDIT_KEYS = {BACKSPACE, 0x53, 0x1C}  # backspace, delete, enter
 
 
+def to_thai(s):
+    return "".join(EN2TH.get(c, c) for c in s)
+
+
+def to_english(s):
+    return "".join(TH2EN.get(c, c) for c in s)
+
+
 class Tracker:
-    """เก็บปุ่มที่กดล่าสุด (เป็นตัวอักษร QWERTY) เพื่อรู้ว่า "คำล่าสุด" คืออะไร"""
+    """เก็บปุ่มที่กดล่าสุด (เป็นตัวอักษร QWERTY) เพื่อรู้ว่า "คำล่าสุด" คืออะไร
+    และจำผลการแก้ครั้งล่าสุด (last_fix) เพื่อให้กดซ้ำแล้วสลับกลับได้"""
 
     def __init__(self):
         self.buf = ""
         self.held = set()
         self.paused = False
+        # (ตัวอักษร QWERTY ของข้อความ, ภาษาที่อยู่บนหน้าจอตอนนี้ 'th'|'en', สลับแป้นให้ไหม)
+        self.last_fix = None
+
+    def reset(self):
+        self.buf = ""
+        self.last_fix = None
 
     def key(self, scan, down):
         if not down:
@@ -59,10 +83,10 @@ class Tracker:
         self.held.add(scan)
         if scan in MODIFIERS:
             return
+        self.last_fix = None  # พิมพ์/ย้ายเคอร์เซอร์ = ผลแก้ครั้งก่อนสลับกลับไม่ได้แล้ว
         shift = bool(self.held & SHIFT_KEYS)
         if scan == BACKSPACE:
-            if not shift:  # Shift+Backspace คือฮอตคีย์ ไม่นับเป็นการลบ
-                self.buf = self.buf[:-1]
+            self.buf = self.buf[:-1]
             return
         if self.held & OTHER_MODS:  # Ctrl/Alt/Win + ปุ่ม = ไม่ใช่การพิมพ์
             self.buf = ""
@@ -110,11 +134,52 @@ def handle_key(tracker, selection, scan, down):
     tracker.key(scan, down)
     if not down or scan in MODIFIERS or tracker.held & OTHER_MODS:
         return
-    is_hotkey = scan == BACKSPACE and bool(tracker.held & SHIFT_KEYS)
-    if (scan in SCAN or scan in EDIT_KEYS) and not is_hotkey:
+    if scan in SCAN or scan in EDIT_KEYS:
         selection.active = False  # พิมพ์/ลบทับ = ไม่มีข้อความคลุมอยู่แล้ว
 
 
+def has_target(tracker, selection):
+    """มีอะไรให้แก้ไหม (ถ้าไม่มี ปล่อย Shift+Backspace ให้ทำงานตามปกติของโปรแกรม)"""
+    return bool(selection.active or tracker.last_fix or tracker.segment())
+
+
+class HotkeyFilter:
+    """ตัวตัดสินว่าปุ่มไหนเป็น Shift+Backspace ของเรา (ทำเองแทนระบบฮอตคีย์ของไลบรารี keyboard
+    เพราะของไลบรารีสถานะปุ่ม modifier เพี้ยนได้เมื่อมีการกดปุ่มจำลองซ้อน ทำให้ใช้ได้แค่ครั้งเดียว)"""
+
+    HOLD_TIMEOUT = 2.0
+
+    def __init__(self, tracker, selection, fire):
+        self.tracker, self.selection, self.fire = tracker, selection, fire
+        self._down = False
+        self._t = 0.0
+
+    def reset(self):
+        self._down = False
+
+    def on_event(self, scan, down, now=None):
+        """คืน True = ปล่อยปุ่มไปถึงโปรแกรม, False = กลืนปุ่มไว้ (ใช้เป็นฮุกแบบ suppress)"""
+        now = time.time() if now is None else now
+        t = self.tracker
+        # ต้องเช็กก่อน paused เสมอ ไม่งั้นปุ่ม Backspace ตอนปล่อยอาจหลุดมา แล้ว Backspace ปกติจะถูกกลืนค้าง
+        if scan == BACKSPACE and self._down:
+            if now - self._t <= self.HOLD_TIMEOUT:
+                if not down:
+                    self._down = False
+                return False  # กลืนทั้งตอนกดค้าง (key repeat) และตอนปล่อย
+            self._down = False  # ค้างนานผิดปกติ ล้างสถานะ
+        if t.paused:
+            return True
+        if (scan == BACKSPACE and down and (t.held & SHIFT_KEYS)
+                and has_target(t, self.selection)):
+            self._down, self._t = True, now
+            self.fire()
+            return False
+        handle_key(t, self.selection, scan, down)
+        return True
+
+
+# ---------- ตรวจแป้นภาษา / แปลงข้อความ ----------
 def current_layout():
     """'th' / 'en' ตามแป้นที่ใช้อยู่ในหน้าต่างปัจจุบัน (Windows) หรือ None ถ้าตรวจไม่ได้"""
     if sys.platform != "win32":
@@ -127,12 +192,12 @@ def current_layout():
 
 
 def plan(segment, layout):
-    """โหมดคำล่าสุด: คืน (จำนวนตัวที่ต้องลบ, ข้อความใหม่)"""
-    as_en = segment
-    as_th = "".join(EN2TH.get(c, c) for c in segment)
+    """โหมดคำล่าสุด: layout = แป้นที่พิมพ์ไว้ตอนนั้น คืน (จำนวนตัวที่ต้องลบ, ข้อความใหม่, ภาษาของข้อความใหม่)"""
     if layout is None:  # เดาจากความเป็นภาษาจริงของแต่ละฝั่ง
-        layout = "en" if thai_score(as_th) > english_score(as_en) else "th"
-    return len(segment), (as_th if layout == "en" else as_en)
+        layout = "en" if thai_score(to_thai(segment)) > english_score(segment) else "th"
+    if layout == "en":
+        return len(segment), to_thai(segment), "th"
+    return len(segment), to_english(segment), "en"  # to_english(ข้อความที่เป็นปุ่ม QWERTY) = เดิม
 
 
 def convert_selection(text):
@@ -143,8 +208,25 @@ def convert_selection(text):
     if th == 0 and en == 0:
         return None
     if th > en:
-        return "".join(TH2EN.get(c, c) for c in text), "en"
-    return "".join(EN2TH.get(c, c) for c in text), "th"
+        return to_english(text), "en"
+    return to_thai(text), "th"
+
+
+def ensure_layout(kb, target):
+    """สลับแป้นภาษาให้ตรงกับ target ('th'/'en') ถ้ายังไม่ตรง"""
+    cur = current_layout()
+    if cur is not None and cur != target:
+        kb.send(SWITCH_HOTKEY)
+
+
+def wait_shift_release(tracker, timeout=None):
+    """รอให้ผู้ใช้ปล่อย Shift (ดูจากปุ่มจริงที่ฮุกเห็น) คืน True ถ้าปล่อยแล้ว"""
+    deadline = time.time() + (SHIFT_WAIT_SEC if timeout is None else timeout)
+    while tracker.held & SHIFT_KEYS:
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
 
 
 def grab_selection(kb):
@@ -167,33 +249,62 @@ def grab_selection(kb):
 
 def run_fix(kb, tracker, selection, lock):
     with lock:
-        tracker.paused = True  # ไม่ให้นับปุ่มที่โปรแกรมกดเอง
         saved = None
         try:
-            kb.release("left shift")
-            kb.release("right shift")
+            released = wait_shift_release(tracker)
+            tracker.paused = True  # ไม่ให้นับปุ่มที่โปรแกรมกดเอง
+            if not released:  # ผู้ใช้กด Shift ค้างนานผิดปกติ: ปล่อย Shift ให้ (ไม่งั้นกลายเป็น Ctrl+Shift+C ฯลฯ)
+                kb.release("left shift")
+                kb.release("right shift")
+                tracker.held.difference_update(SHIFT_KEYS)
+                log.info("shift still held; released by program")
 
             # --- โหมด 1: ข้อความที่คลุมด้วยเมาส์ ---
             if selection.active:
                 picked, saved = grab_selection(kb)
+                picked = picked.replace("\r\n", "\n") if picked else picked
                 result = convert_selection(picked) if picked else None
                 if result:
                     text, target = result
                     kb.write(text)  # พิมพ์ทับข้อความที่คลุมอยู่
                     selection.active = False
                     tracker.buf = ""
-                    if SWITCH_AFTER_SELECTION and current_layout() not in (None, target):
-                        kb.send(SWITCH_HOTKEY)
+                    tracker.last_fix = (text if target == "en" else picked, target, SWITCH_AFTER_SELECTION)
+                    log.info("fix selection: %d chars -> %s", len(text), target)
+                    if SWITCH_AFTER_SELECTION:
+                        ensure_layout(kb, target)
                     return
+                log.info("selection probe: nothing usable copied")
+
+            # --- โหมด 3: กดซ้ำ -> สลับกลับ (อิงภาษาที่จำไว้ว่าอยู่บนหน้าจอ) ---
+            if tracker.last_fix:
+                phys, on_screen, switch = tracker.last_fix
+                if on_screen == "th":
+                    text, target = to_english(phys), "en"
+                else:
+                    text, target = to_thai(phys), "th"
+                for _ in range(len(phys)):
+                    kb.send("backspace")
+                kb.write(text)
+                tracker.last_fix = (phys, target, switch)
+                log.info("toggle: %d chars -> %s", len(phys), target)
+                if switch:
+                    ensure_layout(kb, target)
+                return
 
             # --- โหมด 2: คำล่าสุดที่เพิ่งพิมพ์ ---
             seg = tracker.segment()
             if seg:
-                n, text = plan(seg, current_layout())
+                layout = current_layout()
+                n, text, target = plan(seg, layout)
                 for _ in range(n):
                     kb.send("backspace")
                 kb.write(text)
-                kb.send(SWITCH_HOTKEY)
+                tracker.last_fix = (seg, target, True)
+                log.info("fix last word: %d chars, typed layout=%s -> %s", n, layout, target)
+                ensure_layout(kb, target)
+        except Exception:
+            log.exception("run_fix failed")
         finally:
             if saved is not None:
                 try:
@@ -202,8 +313,8 @@ def run_fix(kb, tracker, selection, lock):
                     pyperclip.copy(saved)
                 except Exception:
                     pass
-            time.sleep(0.15)
-            tracker.held.clear()
+            time.sleep(AFTER_FIX_SEC)
+            tracker.held.intersection_update(SHIFT_KEYS | OTHER_MODS)
             tracker.paused = False
 
 
@@ -213,9 +324,17 @@ def main():
 
     tracker, selection, lock = Tracker(), Selection(), threading.Lock()
 
+    def fire():
+        threading.Thread(target=run_fix, args=(kb, tracker, selection, lock), daemon=True).start()
+
+    flt = HotkeyFilter(tracker, selection, fire)
+
     def on_key(e):
-        if not tracker.paused:
-            handle_key(tracker, selection, e.scan_code, e.event_type == "down")
+        try:
+            return flt.on_event(e.scan_code, e.event_type == "down")
+        except Exception:
+            log.exception("on_key failed")
+            return True
 
     def on_mouse(e):
         if tracker.paused or not isinstance(e, mouse.ButtonEvent) or e.button != "left":
@@ -223,19 +342,13 @@ def main():
         pos = mouse.get_position()
         if e.event_type in ("down", "double"):
             selection.press(pos, time.time(), e.event_type == "double")
-            tracker.buf = ""  # เคอร์เซอร์ย้ายตำแหน่ง คำเดิมใช้ไม่ได้แล้ว
+            tracker.reset()
         elif e.event_type == "up":
             selection.release(pos)
 
-    kb.hook(on_key)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    kb.hook(on_key, suppress=True)
     mouse.hook(on_mouse)
-    kb.add_hotkey(
-        "shift+backspace",
-        lambda: threading.Thread(
-            target=run_fix, args=(kb, tracker, selection, lock), daemon=True
-        ).start(),
-        suppress=True,
-    )
     print("พร้อมใช้งาน: คลุมข้อความด้วยเมาส์ หรือพิมพ์เสร็จ แล้วกด Shift+Backspace (Ctrl+C เพื่อออก)")
     kb.wait()
 
