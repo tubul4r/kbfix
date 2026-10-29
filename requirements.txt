@@ -1,0 +1,6 @@
+keyboard
+mouse
+pyperclip
+pystray
+pillow
+pyinstaller
